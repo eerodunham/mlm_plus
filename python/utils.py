@@ -1,9 +1,10 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from numpy import linalg as la
+import cv2
 
-def get_weights(P: np.ndarray, grid: np.ndarray, alpha=1, eps=1e-8):
-    dist = ((grid[:,:,None,:] - P[None, None, :, :])**2)
+def get_weights(P: np.ndarray, grid: np.ndarray, alpha=1.0, eps=1e-8):
+    dist = np.sum((grid[:,:,None,:] - P[None, None, :, :])**2, axis=-1)
     w = 1.0 / (dist+eps)**alpha
     return w
 
@@ -22,27 +23,23 @@ def compute_constants_from_points(P: np.ndarray, grid: np.ndarray):
 
     """
     #compute weights for each control point. grid shape: (h,w,2); points shape: (npts, 2); 
-    #output shape: (h,w,n)
-    w = get_weights(P, grid)
-    wn = w / w.sum(axis=-1, keepdims=True)
-    #pstar is the weighted sum of all control points distance from each grid point v, with shape (h,w,2)
-    #first, get weighted sum of each control point using matrix multiplication
-        #common dim is n; for each vector i,j in the output, this computes np.dot(weights_col_j, points_row_i) for both elements
-    psum = wn @ P
-    #then divide by sums of weights. phat has shape (h,w,2)
-    pstar = psum / np.sum(wn, axis=-1, keepdims=True)
-    #phat is each control point centered at each grid point; shape: (h,w,n,2)
+    w = get_weights(P, grid) #shape: (h,w,n)
+    wn = w / w.sum(axis=-1, keepdims=True) 
+    #pstar is the centroid of control points relative to each v
+    psum = wn @ P #shape (h,w,2)
+    wsum = np.sum(wn, axis=-1, keepdims=True)
+    pstar = psum / wsum #shape (h,w,2)
+    #phat is the pstar-centered set of control points
     phat = P[None, None] - pstar[:, :, None, :]
-    #compute B; which is the outer product of all wi*phat and phat summed across all control points\
-    B = np.einsum('hwi,hwix,hwiy->hwxy', w, phat, phat)
-    #shape: (h, w, 2, 2)
-    Binv = la.inv(B)
-    vbar = grid - pstar
-    vbarBinv = np.einsum('hwx,hwxy->hwy',vbar,Binv)
-    A = w * np.einsum('hwx,hwny->hwn', vbarBinv, phat)
+    #B is the outer product of all wi*phat and phat summed across all control points 
+    B = np.einsum('hwn,hwnx,hwny->hwxy', w, phat, phat) #shape: (h, w, 2, 2)
+    Binv = la.inv(B) 
+    vbar = grid - pstar #vbar is the pstar-centered set of grid points
+    vbarBinv = np.einsum('hwx,hwxy->hwy',vbar,Binv) #EQ 5
+    A = w * np.einsum('hwy,hwny->hwn', vbarBinv, phat) #EQ 5
     return A, wn
 
-def get_affine(A: np.ndarray, q: np.ndarray, qstar: np.ndarray):
+def get_affine(A: np.ndarray, wn: np.ndarray, q: np.ndarray):
     """
     computes f_a(v) = l_v for all v with AFFINE constraints
     A: (h, w, n) -> constant scalars from P
@@ -51,9 +48,9 @@ def get_affine(A: np.ndarray, q: np.ndarray, qstar: np.ndarray):
 
     returns fa(v): (h,w,2) -> transformed grid vertices
     """
-    #shape (n,2) - (h,w,2) -> (h,w,n,2)
+    qstar = np.einsum('hwn,nx->hwx', wn, q)
     qhat = q[None, None] - qstar[:, :, None, :]
-    #shape (h,w,n) * (h,w,n,2) -> (h,w,n,2)
+    # shape (h,w,n) * (h,w,n,2) -> (h,w,n,2)
     qa = A[..., None] * qhat
     #shape (h, w, 2)
     transformed_v = np.sum(qa, axis=2) + qstar
