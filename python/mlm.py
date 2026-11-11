@@ -6,12 +6,29 @@ import cv2
 from pathlib import Path
 import sys
 import math
+from typing import Any #to silence linter errors
+from grad_aware import d2_geodesic
 
-from utils import get_weights, get_affine, compute_constants_from_points, compute_grid, get_pixel_coords, inv_bilinear, get_similarity, get_rigid
+from utils import get_weights, get_affine, compute_constants_from_points, compute_grid, precompute_weights, inv_bilinear, get_similarity, get_rigid
+
+
+
+WARP = {0: "affine", 1: "similarity", 2: "rigid"}
+DISTANCE_MODE = {0: "euclidean", 1: "hyperbolic", 2: "polar", 3: "gradient"}
 
 RAD = 2
 DRAG_RAD = RAD*2
 PX = 250
+
+MIN_HYP_R = 1.10
+MAX_HYP_R = 2
+
+MIN_LAM = 0.05
+MAX_LAM = 5
+
+def slider_event(x):
+    pass
+
 def click_event_place(event, x, y, flags, param):
     if event==cv2.EVENT_LBUTTONDOWN:
         for i, pt in enumerate(param["points"]):
@@ -75,18 +92,6 @@ def place_points(img, points):
 
     cv2.destroyAllWindows()
 
-def draw_grid(img, grid, dims):
-    cv2.namedWindow("Grid computed")
-    grid_img = img.copy()
-    h, w, _ = grid.shape
-    grid_int = get_pixel_coords(grid, dims)
-    for i in range(h):
-        for j in range(w):
-            pt = grid_int[i,j]
-            cv2.circle(grid_img, pt, 1, (255,0,0), -1)
-    cv2.imshow('Grid computed', grid_img)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
 
 def render_warp(img, g, gt, shift=4):
     h, w = img.shape[:2]
@@ -117,7 +122,7 @@ def render_warp(img, g, gt, shift=4):
     map_x[ys, xs], map_y[ys, xs] = src[:, 0], src[:, 1]
     return cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
 
-
+ 
 def move_points(img,p,name):
     window_name = "Image Deformation with MLM"
     cv2.namedWindow(window_name)
@@ -128,12 +133,33 @@ def move_points(img,p,name):
     q = p.copy()
     state = {"points": q, "selected": None, "drag radius": drag_radius}
     cv2.setMouseCallback(window_name, click_event_warp, param=state)
-    grid = compute_grid(h,w,10)
-    A, wn, vbl = compute_constants_from_points(p, grid, mode="affine")
+    grid = compute_grid(h,w,2)
+    weight_type = "euclidean"; warp_type = "affine"; weight_mode=0; mode=0
+    #hyperbolic weight args
+    center = np.array([(w-1) / 2, (h-1)/ 2]); half_diag = np.hypot((w - 1) / 2, (h - 1) / 2)
+    cv2.createTrackbar("Hyperbolic Radius", window_name, 0, 100, slider_event)
+    p_l_interp = 0
+    R = MIN_HYP_R
+    lam = MIN_LAM*half_diag
+    cv2.createTrackbar("Lambda", window_name, 0, 100, slider_event)
+    
+    wt, wn = precompute_weights(p, grid, weight_type, kw={})
+    A, vbl = compute_constants_from_points(p, grid, wt, wn, mode="affine")
+    geodesic_cost = d2_geodesic(p, grid, img)
     warped = img.copy()
     last_q = q.copy()
-    mode = 0
     while True:
+        l_interp = (cv2.getTrackbarPos("Lambda", window_name) / 100)
+
+        if l_interp != p_l_interp:
+            lam = ((1-l_interp)*MIN_LAM + l_interp*MAX_LAM)*half_diag
+            if weight_type == "polar":
+                kw = dict(center=center, lam=lam)
+                wt, wn = precompute_weights(p, grid, weight_type, **kw)
+                A, vbl = compute_constants_from_points(p, grid, wt, wn, mode=warp_type) #recompute constants
+                np.empty(1)
+            p_l_interp = l_interp
+        
         if not np.array_equal(q, last_q):
 
             if mode == 1:
@@ -146,15 +172,9 @@ def move_points(img,p,name):
             warped = render_warp(img, grid, grid_transformed)
             last_q = q.copy()
 
-        if mode == 0:
-            text = "Mode: Affine"
-            text_color = (255, 88, 114) 
-        elif mode == 1:
-            text = "Mode: Similarity"
-            text_color = (255, 196, 186)
-        else:
-            text = "Mode: Rigid"
-            text_color = (179, 255, 251)
+
+        text = f"Warp mode: {warp_type}; Distance metric: {weight_type}"
+        text_color = (179, 255, 251)
 
         disp = warped.copy()
         
@@ -167,7 +187,7 @@ def move_points(img,p,name):
             text=text,
             org=(10, h-10),                     
             fontFace=cv2.FONT_HERSHEY_PLAIN,  
-            fontScale=scale,
+            fontScale=0.6*scale,
             color=text_color,
             thickness=1,                        
             lineType=cv2.LINE_AA               
@@ -177,29 +197,39 @@ def move_points(img,p,name):
 
         key = cv2.waitKey(1) & 0xFF
 
-        if key == ord("m"):
+        if key == ord("d"):
+            weight_mode +=1
+            weight_mode = weight_mode % len(DISTANCE_MODE.keys())
+            weight_type = DISTANCE_MODE[weight_mode]
+            kw: dict[str, Any] = {}
+            #add support to change center
+            if(weight_type == "hyperbolic"):
+                kw = dict(center=center, R=R)
+
+            elif(weight_type == "polar"):
+                kw = dict(center=center, lam=lam)
+
+            elif(weight_type == "gradient"):
+                kw = {"dist":geodesic_cost}
+
+            wt, wn = precompute_weights(p, grid, weight_type, **kw) #recompute weights
+            A, vbl = compute_constants_from_points(p, grid, wt, wn, mode=warp_type) #recompute constants
+            last_q = np.empty(1) #re-render
+
+
+        elif key == ord("m"):
             mode += 1
             mode = mode % 3
-
-            if mode == 0:
-                A, wn, _ = compute_constants_from_points(p, grid, mode="affine")
-            elif mode == 1:
-                A, wn, _ = compute_constants_from_points(p, grid, mode="similarity")
-            else:
-                A, wn, vbl = compute_constants_from_points(p, grid, mode="rigid")
+            warp_type = WARP[mode]
+            A, vbl = compute_constants_from_points(p, grid, wt, wn, mode=warp_type)
+            last_q = np.empty(1) #re-render
             
         elif key == ord("s"):
-            if mode == 0:
-                warp_type = "aff"
-            elif mode == 1:
-                warp_type = "sim"
-            else:
-                warp_type = "rig"
-
             cv2.imwrite(f"../data/{name}_warped_{warp_type}.png", warped)
 
         elif key in (27, ord("q")):
             break
+    cv2.destroyAllWindows()
 
 #MAIN FUNCTION
 def main():
@@ -228,8 +258,6 @@ def main():
         points.append((w//2, h//2))
     P = np.array(points).astype(np.float32)
     move_points(img, P, name)
-
-
 
 if __name__ == "__main__":
     main()

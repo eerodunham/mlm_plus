@@ -3,42 +3,68 @@ import matplotlib.pyplot as plt
 from numpy import linalg as la
 import cv2
 
-def cross(a, b):
-    return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+# =====================================================================
+#                        UTILITY FUNCTIONS FOR MLS
+# =====================================================================
 
-#inverse bilinear warp function: takes a set of warped, rasterized quads (a,b,c,d) and covered pixels (x) 
-# and finds corresponding (s,t) coordinates that unwarp them
-def inv_bilinear(x,a,b,c,d):
-    e, f, g, hh = b - a, d - a, a - b + c - d, x - a
-    k2, k1, k0 = cross(g, f), cross(e, f) + cross(hh, g), cross(hh, e)
-    lin = np.abs(k2) < 1e-9
-    k2s = np.where(lin, 1.0, k2)
-    disc = np.sqrt(np.maximum(k1 * k1 - 4 * k0 * k2, 0))
-    t1 = (-k1 - disc) / (2 * k2s)
-    t2 = (-k1 + disc) / (2 * k2s)
-    t_lin = -k0 / np.where(np.abs(k1) < 1e-12, 1e-12, k1)
-    def s_of(t):  # pick the better-conditioned component
-        den = e + g * t[..., None]
-        num = hh - f * t[..., None]
-        use_y = np.abs(den[..., 1]) > np.abs(den[..., 0])
-        den_c = np.where(use_y, den[..., 1], den[..., 0])
-        num_c = np.where(use_y, num[..., 1], num[..., 0])
-        return num_c / np.where(np.abs(den_c) < 1e-12, 1e-12, den_c)
-    s1, s2 = s_of(t1), s_of(t2)
-    ok1 = (s1 >= -1e-3) & (s1 <= 1 + 1e-3) & (t1 >= -1e-3) & (t1 <= 1 + 1e-3)
-    t = np.where(lin, t_lin, np.where(ok1, t1, t2))
-    s = np.where(lin, s_of(t_lin), np.where(ok1, s1, s2))
-    return np.clip(s, 0, 1), np.clip(t, 0, 1)
 
-#convert [0,1] to pixel coordinates
-def get_pixel_coords(pt,dims):
-    pixel_coords = np.floor(pt*dims).astype(np.int32)
-    pixel_coords[..., 0] = np.clip(pixel_coords[..., 0], 0, dims[0] - 1)
-    pixel_coords[..., 1] = np.clip(pixel_coords[..., 1], 0, dims[1] - 1)
-    return pixel_coords
+# ---------------------------------------------------------------------
+# Distance Metrics
+# ---------------------------------------------------------------------
+
+def d2_euclidean(grid, P, **k):
+    return np.sum((grid[:,:,None]-P[None,None])**2, axis=-1)
+
+def d2_hyp(grid, P, center, R, **k):
+    #map image onto poincare disk
+    u = (grid - center) / R
+    p = (P - center) / R
+    dist = np.sum((u[:,:, None]-p[None,None])**2, axis=-1)
+    denom = (1 - np.sum(u**2, -1))[:, :, None] * (1 - np.sum(p**2, -1))[None, None]
+    return np.arccosh(1 + 2*dist / denom)**2
+
+def d2_polar(grid, P, center, lam, **k):
+    def rt(x):
+        d = x - center
+        return np.hypot(d[..., 0], d[..., 1]), np.arctan2(d[..., 1], d[..., 0])
+    rv, tv = rt(grid);  rp, tp = rt(P)
+    dr = rv[:, :, None] - rp[None, None]
+    dt = np.angle(np.exp(1j * (tv[:, :, None] - tp[None, None]))) 
+    return dr**2 + (lam * dt)**2
+
+def d2_grad(grid, P, **k):
+    pass
+
+# ---------------------------------------------------------------------
+# Weight/Constants Computation
+# ---------------------------------------------------------------------
+
+DISTANCE_FN = {"euclidean": d2_euclidean, "hyperbolic": d2_hyp, "polar":d2_polar}
+
+def precompute_weights(P, grid, mode="euclidean", alpha=1.0, eps=1e-8, ripple=False, B=0.8, K=0.3, **kw):
+    if(mode == "gradient"):
+        d2 = kw["dist"]
+    else:
+        dist_fn = DISTANCE_FN[mode]
+        d2 = dist_fn(grid, P, **(kw or {}))
+    w = 1.0 / (d2 + eps) ** alpha
+    if ripple:
+        assert abs(B) < 1
+        w *= 1 + B * np.cos(K * np.sqrt(d2))
+    wn = w / w.sum(axis=-1, keepdims=True)
+    return w, wn
+    
+def get_weights(P, grid, dist_fn, alpha=1.0, eps=1e-8, freq=False, B=0.8, K=0.3, **kw):
+    d2 = dist_fn(grid, P, **(kw or {}))
+    w = 1.0 / (d2 + eps) ** alpha
+    if freq:
+        assert abs(B) < 1, "In frequency mode, B (Freq modifier) must satisfy |B| < 1 to keep weights positive"
+        w *= 1 + B * np.cos(K * np.sqrt(d2))
+    wn = w / w.sum(axis=-1, keepdims=True)
+    return w, wn
 
 #compute grid of anchor points (in coordnate-space)
-def compute_grid(h,w, resolution=10):
+def compute_grid(h,w, resolution=20):
     num_x = max(2, w // resolution)
     num_y = max(2, h // resolution)
     x = np.linspace(0, w-1, num_x)
@@ -47,14 +73,8 @@ def compute_grid(h,w, resolution=10):
     grid = np.stack((X,Y), axis=-1)
     return grid
 
-#get weight terms for each anchor point v for each control point p. Pre-process; run before render loop! These are 
-#just constants. See mlm.py or ask Eero about what this means
-def get_weights(P: np.ndarray, grid: np.ndarray, alpha=1.0, eps=1e-8):
-    dist = np.sum((grid[:,:,None,:] - P[None, None, :, :])**2, axis=-1)
-    w = 1.0 / (dist+eps)**alpha
-    return w
 
-def compute_constants_from_points(P: np.ndarray, grid: np.ndarray, mode="affine"):
+def compute_constants_from_points(P: np.ndarray, grid: np.ndarray, w, wn, mode="affine"):
     """Compute constants only dependant on control points P.
 
     Args:
@@ -69,8 +89,6 @@ def compute_constants_from_points(P: np.ndarray, grid: np.ndarray, mode="affine"
 
     """
     #compute weights for each control point. grid shape: (h,w,2); points shape: (npts, 2); 
-    w = get_weights(P, grid) #shape: (h,w,n)
-    wn = w / w.sum(axis=-1, keepdims=True) 
     psum = wn @ P #shape (h,w,2)
     wsum = np.sum(wn, axis=-1, keepdims=True)
     pstar = psum / wsum #shape (h,w,2)
@@ -98,7 +116,7 @@ def compute_constants_from_points(P: np.ndarray, grid: np.ndarray, mode="affine"
         pmat = np.stack([phat, phat_orth], axis=-2) #(h,w,n,2,2)
         vmat = np.stack([vbar, vbar_orth], axis=-2)
         A = np.einsum('hw,hwn,hwnxy,hwzy->hwnxz',mu_s,w,pmat,vmat) #paper equation 7. Output A is (h,w,n,2,2)
-        return A, wn, vbar_len
+        return A, vbar_len
     elif mode == "rigid":
         """PRECOMPUTE CONSTANTS FOR RIGID TRANSFORMATIONS"""
         phat_orth = np.zeros_like(phat)
@@ -110,15 +128,49 @@ def compute_constants_from_points(P: np.ndarray, grid: np.ndarray, mode="affine"
         pmat = np.stack([phat, phat_orth], axis=-2) #(h,w,n,2,2)
         vmat = np.stack([vbar, vbar_orth], axis=-2)
         A = np.einsum('hwn,hwnxy,hwzy->hwnxz',w,pmat,vmat) #paper equation 7, without similarity constant
-        return A, wn, vbar_len
+        return A, vbar_len
     """PRECOMPUTE CONSTANTS FOR AFFINE TRANSFORMATIONS"""
     #B is the outer product of all wi*phat and phat summed across all control points 
     B = np.einsum('hwn,hwnx,hwny->hwxy', w, phat, phat) #shape: (h, w, 2, 2)
     Binv = la.inv(B) 
     vbarBinv = np.einsum('hwx,hwxy->hwy',vbar,Binv) #EQ 5
     A = w * np.einsum('hwy,hwny->hwn', vbarBinv, phat) #EQ 5
-    return A, wn, vbar_len
-    
+    return A, vbar_len
+
+# ---------------------------------------------------------------------
+# Math Helpers
+# ---------------------------------------------------------------------
+
+def cross(a, b):
+    return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+
+#inverse bilinear warp function: takes a set of warped, rasterized quads (a,b,c,d) and covered pixels (x) 
+# and finds corresponding (s,t) coordinates that unwarp them
+def inv_bilinear(x,a,b,c,d):
+    e, f, g, hh = b - a, d - a, a - b + c - d, x - a
+    k2, k1, k0 = cross(g, f), cross(e, f) + cross(hh, g), cross(hh, e)
+    lin = np.abs(k2) < 1e-9
+    k2s = np.where(lin, 1.0, k2)
+    disc = np.sqrt(np.maximum(k1 * k1 - 4 * k0 * k2, 0))
+    t1 = (-k1 - disc) / (2 * k2s)
+    t2 = (-k1 + disc) / (2 * k2s)
+    t_lin = -k0 / np.where(np.abs(k1) < 1e-12, 1e-12, k1)
+    def s_of(t):  # pick the better-conditioned component
+        den = e + g * t[..., None]
+        num = hh - f * t[..., None]
+        use_y = np.abs(den[..., 1]) > np.abs(den[..., 0])
+        den_c = np.where(use_y, den[..., 1], den[..., 0])
+        num_c = np.where(use_y, num[..., 1], num[..., 0])
+        return num_c / np.where(np.abs(den_c) < 1e-12, 1e-12, den_c)
+    s1, s2 = s_of(t1), s_of(t2)
+    ok1 = (s1 >= -1e-3) & (s1 <= 1 + 1e-3) & (t1 >= -1e-3) & (t1 <= 1 + 1e-3)
+    t = np.where(lin, t_lin, np.where(ok1, t1, t2))
+    s = np.where(lin, s_of(t_lin), np.where(ok1, s1, s2))
+    return np.clip(s, 0, 1), np.clip(t, 0, 1)
+
+# ---------------------------------------------------------------------
+# Transformations
+# ---------------------------------------------------------------------
 
 def get_affine(A: np.ndarray, wn: np.ndarray, q: np.ndarray):
     """
