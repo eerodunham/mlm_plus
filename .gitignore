@@ -34,3 +34,4 @@ vcpkg-configuration.json
 Thumbs.db
 desktop.ini
 */__pycache__/
+data/
