@@ -9,9 +9,7 @@ import math
 from typing import Any #to silence linter errors
 from grad_aware import d2_geodesic
 
-from utils import get_weights, get_affine, compute_constants_from_points, compute_grid, precompute_weights, inv_bilinear, get_similarity, get_rigid
-
-
+from utils import get_affine, compute_constants_from_points, compute_grid, precompute_weights, inv_bilinear, get_similarity, get_rigid
 
 WARP = {0: "affine", 1: "similarity", 2: "rigid"}
 DISTANCE_MODE = {0: "euclidean", 1: "hyperbolic", 2: "polar", 3: "gradient"}
@@ -133,21 +131,22 @@ def move_points(img,p,name):
     q = p.copy()
     state = {"points": q, "selected": None, "drag radius": drag_radius}
     cv2.setMouseCallback(window_name, click_event_warp, param=state)
-    grid = compute_grid(h,w,2)
+    grid = compute_grid(h,w,4)
     weight_type = "euclidean"; warp_type = "affine"; weight_mode=0; mode=0
     #hyperbolic weight args
     center = np.array([(w-1) / 2, (h-1)/ 2]); half_diag = np.hypot((w - 1) / 2, (h - 1) / 2)
-    cv2.createTrackbar("Hyperbolic Radius", window_name, 0, 100, slider_event)
     p_l_interp = 0
     R = MIN_HYP_R
     lam = MIN_LAM*half_diag
+    ripple = False
     cv2.createTrackbar("Lambda", window_name, 0, 100, slider_event)
-    
-    wt, wn = precompute_weights(p, grid, weight_type, kw={})
+    kw: dict[str, Any] = {}
+    wt, wn = precompute_weights(p, grid, weight_type, ripple=ripple, kw=kw)
     A, vbl = compute_constants_from_points(p, grid, wt, wn, mode="affine")
     geodesic_cost = d2_geodesic(p, grid, img)
     warped = img.copy()
     last_q = q.copy()
+    
     while True:
         l_interp = (cv2.getTrackbarPos("Lambda", window_name) / 100)
 
@@ -155,7 +154,7 @@ def move_points(img,p,name):
             lam = ((1-l_interp)*MIN_LAM + l_interp*MAX_LAM)*half_diag
             if weight_type == "polar":
                 kw = dict(center=center, lam=lam)
-                wt, wn = precompute_weights(p, grid, weight_type, **kw)
+                wt, wn = precompute_weights(p, grid, weight_type, ripple=ripple, **kw)
                 A, vbl = compute_constants_from_points(p, grid, wt, wn, mode=warp_type) #recompute constants
                 np.empty(1)
             p_l_interp = l_interp
@@ -172,8 +171,8 @@ def move_points(img,p,name):
             warped = render_warp(img, grid, grid_transformed)
             last_q = q.copy()
 
-
-        text = f"Warp mode: {warp_type}; Distance metric: {weight_type}"
+        ripple_status = "on" if ripple else "off"
+        text = f"Warp mode: {warp_type}; Distance metric: {weight_type}; Ripple mode: {ripple_status}"
         text_color = (179, 255, 251)
 
         disp = warped.copy()
@@ -201,7 +200,6 @@ def move_points(img,p,name):
             weight_mode +=1
             weight_mode = weight_mode % len(DISTANCE_MODE.keys())
             weight_type = DISTANCE_MODE[weight_mode]
-            kw: dict[str, Any] = {}
             #add support to change center
             if(weight_type == "hyperbolic"):
                 kw = dict(center=center, R=R)
@@ -212,7 +210,7 @@ def move_points(img,p,name):
             elif(weight_type == "gradient"):
                 kw = {"dist":geodesic_cost}
 
-            wt, wn = precompute_weights(p, grid, weight_type, **kw) #recompute weights
+            wt, wn = precompute_weights(p, grid, weight_type, ripple=ripple, **kw) #recompute weights
             A, vbl = compute_constants_from_points(p, grid, wt, wn, mode=warp_type) #recompute constants
             last_q = np.empty(1) #re-render
 
@@ -226,6 +224,12 @@ def move_points(img,p,name):
             
         elif key == ord("s"):
             cv2.imwrite(f"../data/{name}_warped_{warp_type}.png", warped)
+
+        elif key == ord("r"):
+            ripple = not ripple
+            wt, wn = precompute_weights(p, grid, weight_type, ripple=ripple, **kw) #recompute weights
+            A, vbl = compute_constants_from_points(p, grid, wt, wn, mode=warp_type) #recompute constants
+            last_q = np.empty(1) #re-render
 
         elif key in (27, ord("q")):
             break

@@ -8,7 +8,7 @@ from scipy.ndimage import map_coordinates
 import cv2
 
 #precompute distances based on minimizing the energy function equal to sum(|grad|)
-def d2_geodesic(P, grid, img, step=2, blur_sigma=1.5, B=25, eps=1e-9):
+def d2_geodesic(P, grid, img, step=2, blur_sigma=1.5, B=20, eps=1e-9):
     cost = compute_cost(img, step, blur_sigma, B)
     gh, gw = cost.shape
     n_nodes = gh * gw
@@ -32,9 +32,17 @@ def d2_geodesic(P, grid, img, step=2, blur_sigma=1.5, B=25, eps=1e-9):
 #compute the gradient magnitude across the image using a sobel filter
 def compute_cost(img, step, blur_sigma, B):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float64) / 255
-    gray = cv2.GaussianBlur(gray, (0,0), blur_sigma) #blur to smooth features so small gradient changes don't affect image
-    #IMPROVEMENT: blur more, take laplacian, etc
-    gradient = np.hypot(cv2.Sobel(gray, cv2.CV_64F, 1, 0), cv2.Sobel(gray, cv2.CV_64F, 0, 1))
+
+    #standard blur first
+    blur = cv2.GaussianBlur(gray, (0,0), blur_sigma)
+    laplacian = -cv2.Laplacian(blur, cv2.CV_64F, ksize=3)
+    blur2 = cv2.GaussianBlur(gray, (0,0), blur_sigma*1.5)
+    gblur = np.asarray(np.hypot(cv2.Sobel(blur2, cv2.CV_64F, 1, 0), cv2.Sobel(blur2, cv2.CV_64F, 0, 1)))
+    gblur_norm = gblur / np.percentile(gblur, 99) + 1e-12
+    edge_mask = np.clip(gblur_norm, 0, 1)**2
+    grad_boosted = blur + 0.5 * (edge_mask * laplacian)
+
+    gradient = np.hypot(cv2.Sobel(grad_boosted, cv2.CV_64F, 1, 0), cv2.Sobel(grad_boosted, cv2.CV_64F, 0, 1))
     gradient /= np.percentile(gradient, 99) + 1e-12 #Robustness: normalize with respect to non-outlier max
     max_pool = cv2.dilate(gradient, np.ones((step,step))) #take max value in subsampling region with uniform weights
     cost = 1 + B* np.clip(max_pool[::step, ::step],0,1) #sub-sample by step in both directions. clip and rescale.
