@@ -1,4 +1,4 @@
-# MLM PLUS 
+# MLS PLUS 
 **Implementation of Moving Least Squares for CS 445, Fall 2026**
 By John Barry, Eero Dunham & Lucy Wu
 
