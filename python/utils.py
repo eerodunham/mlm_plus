@@ -32,21 +32,25 @@ def d2_polar(grid, P, center, lam, **k):
     dt = np.angle(np.exp(1j * (tv[:, :, None] - tp[None, None]))) 
     return dr**2 + (lam * dt)**2
 
-def d2_grad(grid, P, **k):
-    pass
+def d_hyp(z, w):
+    return 2 * np.arctanh(np.abs((z - w) / (1 - np.conj(w) * z)))
+
+def d2_disk(z_grid, z_p, **k):
+    return d_hyp(z_grid[..., None], z_p[None, None]) ** 2
 
 # ---------------------------------------------------------------------
 # Weight/Constants Computation
 # ---------------------------------------------------------------------
 
-DISTANCE_FN = {"euclidean": d2_euclidean, "hyperbolic": d2_hyp, "polar":d2_polar}
+DISTANCE_FN = {"euclidean": d2_euclidean, "disk": d2_disk, "polar":d2_polar}
 
-def precompute_weights(P, grid, mode="euclidean", alpha=1.0, eps=1e-8, ripple=False, B=0.8, K=0.3, **kw):
+def precompute_weights(P, grid, mode="euclidean", alpha=1.0, eps=1e-8, ripple=False, B=0.8, K=0.3, dist_kw=None):
+    dist_kw = dist_kw or {}
     if(mode == "gradient"):
-        d2 = kw["dist"]
+        d2 = dist_kw["dist"]
     else:
         dist_fn = DISTANCE_FN[mode]
-        d2 = dist_fn(grid, P, **(kw or {}))
+        d2 = dist_fn(grid, P, **dist_kw)
     w = 1.0 / (d2 + eps) ** alpha
     if ripple:
         assert abs(B) < 1
@@ -73,6 +77,42 @@ def compute_grid(h,w, resolution=20):
     grid = np.stack((X,Y), axis=-1)
     return grid
 
+def compute_constants_from_centered(phat, vbar, w, mode="affine"):
+    vbar_len = np.sqrt(np.einsum('hwx,hwx->hw', vbar, vbar))
+    if mode == "similarity":
+        """PRECOMPUTE CONSTANTS FOR SIMILARITY TRANSFORMATIONS"""
+        #orth((x,y)) = (-y,x)
+        phat_orth = np.zeros_like(phat)
+        phat_orth[:,:,:,0] = phat[:,:,:,1]
+        phat_orth[:,:,:,1] = -phat[:,:,:,0]
+        vbar_orth = np.zeros_like(vbar)
+        vbar_orth[:,:,0] = vbar[:,:,1]
+        vbar_orth[:,:,1] = -vbar[:,:,0]
+        #mu_s = sum_i w_ip_ip_i^T ->sum of inner products between weighted control points and unweighted control points 
+        mu_s = 1.0 / np.einsum('hwn,hwnx,hwnx->hw',w,phat,phat) #(h,w)
+        pmat = np.stack([phat, phat_orth], axis=-2) #(h,w,n,2,2)
+        vmat = np.stack([vbar, vbar_orth], axis=-2)
+        A = np.einsum('hw,hwn,hwnxy,hwzy->hwnxz',mu_s,w,pmat,vmat) #paper equation 7. Output A is (h,w,n,2,2)
+        return A, vbar_len
+    elif mode == "rigid":
+        """PRECOMPUTE CONSTANTS FOR RIGID TRANSFORMATIONS"""
+        phat_orth = np.zeros_like(phat)
+        phat_orth[:,:,:,0] = phat[:,:,:,1]
+        phat_orth[:,:,:,1] = -phat[:,:,:,0]
+        vbar_orth = np.zeros_like(vbar)
+        vbar_orth[:,:,0] = vbar[:,:,1]
+        vbar_orth[:,:,1] = -vbar[:,:,0]
+        pmat = np.stack([phat, phat_orth], axis=-2) #(h,w,n,2,2)
+        vmat = np.stack([vbar, vbar_orth], axis=-2)
+        A = np.einsum('hwn,hwnxy,hwzy->hwnxz',w,pmat,vmat) #paper equation 7, without similarity constant
+        return A, vbar_len
+    """PRECOMPUTE CONSTANTS FOR AFFINE TRANSFORMATIONS"""
+    #B is the outer product of all wi*phat and phat summed across all control points 
+    B = np.einsum('hwn,hwnx,hwny->hwxy', w, phat, phat) #shape: (h, w, 2, 2)
+    Binv = la.inv(B) 
+    vbarBinv = np.einsum('hwx,hwxy->hwy',vbar,Binv) #EQ 5
+    A = w * np.einsum('hwy,hwny->hwn', vbarBinv, phat) #EQ 5
+    return A, vbar_len
 
 def compute_constants_from_points(P: np.ndarray, grid: np.ndarray, w, wn, mode="affine"):
     """Compute constants only dependant on control points P.
@@ -171,6 +211,22 @@ def inv_bilinear(x,a,b,c,d):
 # ---------------------------------------------------------------------
 # Transformations
 # ---------------------------------------------------------------------
+
+
+def tangent_sum(A,qhat,mode="affine",vbl=None):
+    if mode == "affine":
+        return np.einsum('hwn,hwnx->hwx', A, qhat)
+    elif mode == "similarity":
+        return np.einsum('hwnx,hwnxy->hwy', qhat, A)  
+    assert vbl is not None
+    f_r_v = np.einsum('hwnx,hwnxy->hwy',qhat,A)
+    norm_fr = 1.0 / np.maximum(np.sqrt(np.einsum('hwx,hwx->hw', f_r_v, f_r_v)), 1e-12)
+    return np.einsum('hw,hw,hwx->hwx', vbl, norm_fr, f_r_v)
+
+def deform_euclidean(A, wn, q, mode, vbl):
+    qstar = np.einsum('hwn,nx->hwx', wn, q)
+    qhat = q[None, None] - qstar[:, :, None, :]
+    return tangent_sum(A, qhat, mode, vbl) + qstar
 
 def get_affine(A: np.ndarray, wn: np.ndarray, q: np.ndarray):
     """

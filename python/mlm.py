@@ -9,14 +9,16 @@ import math
 from typing import Any #to silence linter errors
 from grad_aware import d2_geodesic
 
-from utils import get_affine, compute_constants_from_points, compute_grid, precompute_weights, inv_bilinear, get_similarity, get_rigid
-
-WARP = {0: "affine", 1: "similarity", 2: "rigid"}
-DISTANCE_MODE = {0: "euclidean", 1: "hyperbolic", 2: "polar", 3: "gradient"}
+from utils import deform_euclidean, compute_constants_from_points, compute_grid, precompute_weights, inv_bilinear
+from hyperbolic import deform_hyperbolic, screen_to_disk, disk_to_screen, image_to_disk, disk_to_image, compute_constants_from_hyperbolic_points
+WARPS   = ["affine", "similarity", "rigid"]
+METRICS = ["euclidean", "polar", "gradient", "hyperbolic"]
 
 RAD = 2
 DRAG_RAD = RAD*2
 PX = 250
+
+RIPPLE_K_DISK = 0.3
 
 MIN_HYP_R = 1.10
 MAX_HYP_R = 2
@@ -46,19 +48,29 @@ def click_event_place(event, x, y, flags, param):
         param["selected"] = None
 
 def click_event_warp(event, x, y, flags, param):
-    if event==cv2.EVENT_LBUTTONDOWN:
-        for i, pt in enumerate(param["points"]):
-            dist = math.hypot(x-pt[0], y-pt[1])
-            if dist <= param["drag radius"]:
-                param["selected"] = i
-                break
-
-    elif event==cv2.EVENT_MOUSEMOVE:  
-        if param["selected"] is not None:
-            param["points"][param["selected"]] = (x,y)
-
+    if event == cv2.EVENT_LBUTTONDOWN:
+        for i, pt in enumerate(param["to_screen"](param["points"])):
+            if math.hypot(x - pt[0], y - pt[1]) <= param["drag radius"]:
+                param["selected"] = i; break
+    elif event == cv2.EVENT_MOUSEMOVE and param["selected"] is not None:
+        param["points"][param["selected"]] = param["from_screen"](np.array([x, y], float))
     elif event == cv2.EVENT_LBUTTONUP:
-            param["selected"] = None
+        param["selected"] = None
+
+# def click_event_warp(event, x, y, flags, param):
+#     if event==cv2.EVENT_LBUTTONDOWN:
+#         for i, pt in enumerate(param["points"]):
+#             dist = math.hypot(x-pt[0], y-pt[1])
+#             if dist <= param["drag radius"]:
+#                 param["selected"] = i
+#                 break
+
+#     elif event==cv2.EVENT_MOUSEMOVE:  
+#         if param["selected"] is not None:
+#             param["points"][param["selected"]] = (x,y)
+
+#     elif event == cv2.EVENT_LBUTTONUP:
+#             param["selected"] = None
 
 def place_points(img, points):
     print("-----++++++INSTRUCTIONS++++++-----\nClick to place a new control point. Click and drag to move an existing one. Q or ESC to exit window. R to reset points.")
@@ -91,8 +103,8 @@ def place_points(img, points):
     cv2.destroyAllWindows()
 
 
-def render_warp(img, g, gt, shift=4):
-    h, w = img.shape[:2]
+def render_warp(img, g, gt, out_dims, shift=4):
+    h, w = out_dims
     gh, gw = g.shape[:2]
     raster_ids = np.full((h,w),-1,np.int32)
     #multiply by 2^shift
@@ -120,126 +132,102 @@ def render_warp(img, g, gt, shift=4):
     map_x[ys, xs], map_y[ys, xs] = src[:, 0], src[:, 1]
     return cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
 
- 
-def move_points(img,p,name):
-    window_name = "Image Deformation with MLM"
-    cv2.namedWindow(window_name)
-    h, w, _ = img.shape
-    scale = max(h,w) / PX
-    radius = np.floor(scale*RAD).astype(int)
-    drag_radius = np.floor(scale*DRAG_RAD)
-    q = p.copy()
-    state = {"points": q, "selected": None, "drag radius": drag_radius}
-    cv2.setMouseCallback(window_name, click_event_warp, param=state)
-    grid = compute_grid(h,w,4)
-    weight_type = "euclidean"; warp_type = "affine"; weight_mode=0; mode=0
-    #hyperbolic weight args
-    center = np.array([(w-1) / 2, (h-1)/ 2]); half_diag = np.hypot((w - 1) / 2, (h - 1) / 2)
-    p_l_interp = 0
-    R = MIN_HYP_R
-    lam = MIN_LAM*half_diag
-    ripple = False
-    cv2.createTrackbar("Lambda", window_name, 0, 100, slider_event)
-    kw: dict[str, Any] = {}
-    wt, wn = precompute_weights(p, grid, weight_type, ripple=ripple, kw=kw)
-    A, vbl = compute_constants_from_points(p, grid, wt, wn, mode="affine")
-    geodesic_cost = d2_geodesic(p, grid, img)
-    warped = img.copy()
-    last_q = q.copy()
+def move_points(img,p,name,K=2.5,S=800):
+    h, w = img.shape[:2]
+    win = "Image Deformation with MLS"
+    cv2.namedWindow(win)
+    grid = compute_grid(h, w, 4)
+    MARGIN = 40
+    S = max(800, max(h, w) + 2 * MARGIN)                  # one canvas size for every mode
+    scr_c = np.array([(S - 1) / 2] * 2); r_px = S / 2 - 10
+    offset = np.array([(S - w) / 2, (S - h) / 2])  
+    img_c = np.array([(w - 1) / 2, (h - 1) / 2]); half_diag = np.hypot(*img_c)
+    r_px = S / 2 - 10
+    to_disk = lambda x: image_to_disk(x, img_c, K, half_diag) #convert image coords x to disk coords z
+    from_disk = lambda z: disk_to_image(z, img_c, K, half_diag) #convert poincare disk coords z to image coords x
+    z_grid = to_disk(grid) 
+    z_p = to_disk(p)
+    geo_d2 = d2_geodesic(p, grid, img)
+    q = p.copy() #image space coords
+    warp_state = dict(metric=0, warp=0, ripple=False, lam=MIN_LAM * half_diag)
+    state = {"points": q, "selected": None, "drag radius": DRAG_RAD,
+             "to_screen": None, "from_screen": None}
+    cv2.setMouseCallback(win, click_event_warp, param=state)
+    cv2.createTrackbar("Lambda", win, 0, 100, lambda _: None)
+    hyp = lambda: METRICS[warp_state["metric"]] == "hyperbolic"
+    def rebuild():
+        metric = METRICS[warp_state["metric"]]
+        warp = WARPS[warp_state["warp"]]
+        if hyp():
+            wt, wn = precompute_weights(z_p, z_grid, "disk", eps=1e-12, ripple=bool(warp_state["ripple"]), K=RIPPLE_K_DISK)
+            A, vbl = compute_constants_from_hyperbolic_points(z_p, z_grid, wt, wn, mode=warp)
+            state["to_screen"]   = lambda x: disk_to_screen(to_disk(x), scr_c, r_px)
+            state["from_screen"] = lambda y: from_disk(screen_to_disk(y, scr_c, r_px))
+        else:
+            dist_kw = {"polar": dict(center=img_c, lam=warp_state["lam"]), "gradient": dict(dist=geo_d2)}.get(metric, {})
+            wt, wn = precompute_weights(p, grid, metric, ripple=bool(warp_state["ripple"]), dist_kw=dist_kw)
+            A, vbl = compute_constants_from_points(p, grid, wt, wn, mode=warp)
+            state["to_screen"] = lambda x: x+offset
+            state["from_screen"] = lambda y: y - offset
+        return A, wn, vbl
     
+    def render(A, wn, vbl):
+        warp = WARPS[warp_state["warp"]]
+
+        if hyp():
+            dest = disk_to_screen(deform_hyperbolic(A, wn, to_disk(q), warp, vbl), scr_c, r_px)
+            out = render_warp(img, grid, dest, (S, S))
+            cv2.circle(out, tuple(int(c) for c in scr_c), int(r_px), (90, 90, 90), 1) #render outer rim
+            return out
+        
+        return render_warp(img, grid, deform_euclidean(A, wn, q, warp, vbl)+offset, (S, S))
+
+    model, dirty, last_q = rebuild(), False, None
+    # MAIN RENDER LOOP
     while True:
-        l_interp = (cv2.getTrackbarPos("Lambda", window_name) / 100)
-
-        if l_interp != p_l_interp:
-            lam = ((1-l_interp)*MIN_LAM + l_interp*MAX_LAM)*half_diag
-            if weight_type == "polar":
-                kw = dict(center=center, lam=lam)
-                wt, wn = precompute_weights(p, grid, weight_type, ripple=ripple, **kw)
-                A, vbl = compute_constants_from_points(p, grid, wt, wn, mode=warp_type) #recompute constants
-                np.empty(1)
-            p_l_interp = l_interp
-        
-        if not np.array_equal(q, last_q):
-
-            if mode == 1:
-                grid_transformed = get_similarity(A, wn, q)
-            elif mode == 2:
-                grid_transformed = get_rigid(A, wn, q, vbl)
-            else:
-                grid_transformed = get_affine(A, wn, q)
-            
-            warped = render_warp(img, grid, grid_transformed)
+        t = cv2.getTrackbarPos("Lambda", win) / 100
+        lam = ((1 - t) * MIN_LAM + t * MAX_LAM) * half_diag
+        if lam != warp_state["lam"]:
+            warp_state["lam"] = lam
+            dirty |= METRICS[warp_state["metric"]] == "polar"
+        if dirty:
+            model, dirty, last_q = rebuild(), False, None
+        if last_q is None or not np.array_equal(q, last_q):
+            warped = render(*model)
             last_q = q.copy()
-
-        ripple_status = "on" if ripple else "off"
-        text = f"Warp mode: {warp_type}; Distance metric: {weight_type}; Ripple mode: {ripple_status}"
-        text_color = (179, 255, 251)
-
         disp = warped.copy()
-        
-        for i, pt in enumerate(q):
+        for i, pt in enumerate(state["to_screen"](q)):
             color = (0, 0, 255) if i == state["selected"] else (0, 255, 0)
-            cv2.circle(disp, tuple(int(c) for c in pt), radius, color, -1)
+            cv2.circle(disp, tuple(int(c) for c in pt), RAD, color, -1)
 
-        cv2.putText(
-            img=disp,
-            text=text,
-            org=(10, h-10),                     
-            fontFace=cv2.FONT_HERSHEY_PLAIN,  
-            fontScale=0.6*scale,
-            color=text_color,
-            thickness=1,                        
-            lineType=cv2.LINE_AA               
-        )
-
-        cv2.imshow(window_name, disp)
+        cv2.setWindowTitle(win, f"{WARPS[warp_state['warp']]} | {METRICS[warp_state['metric']]} | ripple "
+                                f"{'on' if warp_state['ripple'] else 'off'}   [m]ode [d]istance [r]ipple [s]ave [q]uit")
+        cv2.imshow(win, disp)
 
         key = cv2.waitKey(1) & 0xFF
+        if key == ord("m"): 
+            warp_state["warp"] = (warp_state["warp"] + 1) % len(WARPS)
+            dirty = True
+        elif key == ord("d"): 
+            warp_state["metric"] = (warp_state["metric"] + 1) % len(METRICS)
+            dirty = True
+        elif key == ord("r"): 
+            warp_state["ripple"] = not warp_state["ripple"]
+            dirty = True
+        elif key == ord("s"): 
+            cv2.imwrite(f"../data/{name}_{METRICS[warp_state['metric']]}_{WARPS[warp_state['warp']]}.png", warped)
 
-        if key == ord("d"):
-            weight_mode +=1
-            weight_mode = weight_mode % len(DISTANCE_MODE.keys())
-            weight_type = DISTANCE_MODE[weight_mode]
-            #add support to change center
-            if(weight_type == "hyperbolic"):
-                kw = dict(center=center, R=R)
+        elif key in (27, ord("q")): break
 
-            elif(weight_type == "polar"):
-                kw = dict(center=center, lam=lam)
-
-            elif(weight_type == "gradient"):
-                kw = {"dist":geodesic_cost}
-
-            wt, wn = precompute_weights(p, grid, weight_type, ripple=ripple, **kw) #recompute weights
-            A, vbl = compute_constants_from_points(p, grid, wt, wn, mode=warp_type) #recompute constants
-            last_q = np.empty(1) #re-render
-
-
-        elif key == ord("m"):
-            mode += 1
-            mode = mode % 3
-            warp_type = WARP[mode]
-            A, vbl = compute_constants_from_points(p, grid, wt, wn, mode=warp_type)
-            last_q = np.empty(1) #re-render
-            
-        elif key == ord("s"):
-            cv2.imwrite(f"../data/{name}_warped_{warp_type}.png", warped)
-
-        elif key == ord("r"):
-            ripple = not ripple
-            wt, wn = precompute_weights(p, grid, weight_type, ripple=ripple, **kw) #recompute weights
-            A, vbl = compute_constants_from_points(p, grid, wt, wn, mode=warp_type) #recompute constants
-            last_q = np.empty(1) #re-render
-
-        elif key in (27, ord("q")):
-            break
     cv2.destroyAllWindows()
+
 
 #MAIN FUNCTION
 def main():
     parser = ap.ArgumentParser(description="MLM Python Demo")
     parser.add_argument("path", type=str, help="Path to image file.")
     parser.add_argument("-o", "--output_name", default=None, type=str, help="name of output file (without filetype)")
+    parser.add_argument("-k", "--hyperbolic_kappa", default=2.5, type=np.float32, help="Number of hyperbolic unit distances the image's screen half-diagonal should cover")
     args = parser.parse_args()
 
     img_path = Path(args.path)
@@ -261,7 +249,7 @@ def main():
         print("adding center point")
         points.append((w//2, h//2))
     P = np.array(points).astype(np.float32)
-    move_points(img, P, name)
+    move_points(img, P, name,K=args.hyperbolic_kappa)
 
 if __name__ == "__main__":
     main()
