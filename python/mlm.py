@@ -132,16 +132,19 @@ def render_warp(img, g, gt, out_dims, shift=4):
     map_x[ys, xs], map_y[ys, xs] = src[:, 0], src[:, 1]
     return cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
 
-def move_points(img,p,name,K=2.5,S=800):
+def move_points(img,p,name,K=2.5,S=800,grid_res=10):
     h, w = img.shape[:2]
+    scale = max(h,w) / PX
     win = "Image Deformation with MLS"
     cv2.namedWindow(win)
-    grid = compute_grid(h, w, 4)
+    grid = compute_grid(h, w, grid_res)
     MARGIN = 40
-    S = max(800, max(h, w) + 2 * MARGIN)                  # one canvas size for every mode
-    scr_c = np.array([(S - 1) / 2] * 2); r_px = S / 2 - 10
+    S = max(S, max(h, w) + 2 * MARGIN)                  # one canvas size for every mode
+    scr_c = np.array([(S - 1) / 2] * 2)
+    r_px = S / 2 - 10
     offset = np.array([(S - w) / 2, (S - h) / 2])  
-    img_c = np.array([(w - 1) / 2, (h - 1) / 2]); half_diag = np.hypot(*img_c)
+    img_c = np.array([(w - 1) / 2, (h - 1) / 2])
+    half_diag = np.hypot(*img_c)
     r_px = S / 2 - 10
     to_disk = lambda x: image_to_disk(x, img_c, K, half_diag) #convert image coords x to disk coords z
     from_disk = lambda z: disk_to_image(z, img_c, K, half_diag) #convert poincare disk coords z to image coords x
@@ -177,10 +180,28 @@ def move_points(img,p,name,K=2.5,S=800):
         if hyp():
             dest = disk_to_screen(deform_hyperbolic(A, wn, to_disk(q), warp, vbl), scr_c, r_px)
             out = render_warp(img, grid, dest, (S, S))
-            cv2.circle(out, tuple(int(c) for c in scr_c), int(r_px), (90, 90, 90), 1) #render outer rim
             return out
         
         return render_warp(img, grid, deform_euclidean(A, wn, q, warp, vbl)+offset, (S, S))
+
+    def load_image(new_img, new_p):
+        nonlocal img, p, h, w, grid, img_c, half_diag, offset, z_grid, z_p, geo_d2, model, last_q
+        img = new_img
+        h, w = img.shape[:2]
+        grid = compute_grid(h, w, grid_res)
+        img_c = np.array([(w - 1) / 2, (h - 1) / 2])
+        half_diag = np.hypot(*img_c)
+        offset = np.array([(S - w) / 2, (S - h) / 2])
+        p = np.asarray(new_p, float)
+        q[:] = p 
+        z_grid, z_p = to_disk(grid), to_disk(p)
+        geo_d2 = d2_geodesic(p, grid, img)
+        model, last_q = rebuild(), None  
+
+    def bake():
+        shown = state["to_screen"](q) # handle positions on the canvas
+        x, y, bw, bh = cv2.boundingRect(warped.any(-1).astype(np.uint8))# crop to bounding box around the content
+        load_image(warped[y:y + bh, x:x + bw].copy(), shown - [x, y])
 
     model, dirty, last_q = rebuild(), False, None
     # MAIN RENDER LOOP
@@ -198,7 +219,10 @@ def move_points(img,p,name,K=2.5,S=800):
         disp = warped.copy()
         for i, pt in enumerate(state["to_screen"](q)):
             color = (0, 0, 255) if i == state["selected"] else (0, 255, 0)
-            cv2.circle(disp, tuple(int(c) for c in pt), RAD, color, -1)
+            cv2.circle(disp, tuple(int(c) for c in pt), int(scale*RAD), color, -1)
+
+        if hyp():
+            cv2.circle(disp, tuple(int(c) for c in scr_c), int(r_px), (90, 90, 90), 1) #render outer rim
 
         cv2.setWindowTitle(win, f"{WARPS[warp_state['warp']]} | {METRICS[warp_state['metric']]} | ripple "
                                 f"{'on' if warp_state['ripple'] else 'off'}   [m]ode [d]istance [r]ipple [s]ave [q]uit")
@@ -216,6 +240,8 @@ def move_points(img,p,name,K=2.5,S=800):
             dirty = True
         elif key == ord("s"): 
             cv2.imwrite(f"../data/{name}_{METRICS[warp_state['metric']]}_{WARPS[warp_state['warp']]}.png", warped)
+        elif key == ord("b"):
+            bake()
 
         elif key in (27, ord("q")): break
 
@@ -227,7 +253,10 @@ def main():
     parser = ap.ArgumentParser(description="MLM Python Demo")
     parser.add_argument("path", type=str, help="Path to image file.")
     parser.add_argument("-o", "--output_name", default=None, type=str, help="name of output file (without filetype)")
-    parser.add_argument("-k", "--hyperbolic_kappa", default=2.5, type=np.float32, help="Number of hyperbolic unit distances the image's screen half-diagonal should cover")
+    parser.add_argument("-k", "--kap_hyp", default=2.5, type=np.float32, help="Number of hyperbolic unit distances the image's screen half-diagonal should cover")
+    parser.add_argument("-r", "--grid_res", default=10, type=int, help="Number of pixels per grid square axis")
+    parser.add_argument("-c", "--canvas", default=800, type=int, help="Number of pixels per canvas axis")
+
     args = parser.parse_args()
 
     img_path = Path(args.path)
@@ -249,7 +278,7 @@ def main():
         print("adding center point")
         points.append((w//2, h//2))
     P = np.array(points).astype(np.float32)
-    move_points(img, P, name,K=args.hyperbolic_kappa)
+    move_points(img, P, name,K=args.kap_hyp,S=args.canvas,grid_res=args.grid_res)
 
 if __name__ == "__main__":
     main()
