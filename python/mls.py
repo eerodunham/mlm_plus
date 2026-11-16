@@ -8,6 +8,7 @@ import sys
 import math
 from typing import Any #to silence linter errors
 from grad_aware import d2_geodesic
+import copy
 
 from utils import deform_euclidean, compute_constants_from_points, compute_grid, precompute_weights, inv_bilinear
 from hyperbolic import deform_hyperbolic, screen_to_disk, disk_to_screen, image_to_disk, disk_to_image, compute_constants_from_hyperbolic_points
@@ -49,11 +50,16 @@ def click_event_place(event, x, y, flags, param):
 
 def click_event_warp(event, x, y, flags, param):
     if event == cv2.EVENT_LBUTTONDOWN:
-        for i, pt in enumerate(param["to_screen"](param["points"])):
+        for i, pt in enumerate(param["to_screen"](param["q"])):
             if math.hypot(x - pt[0], y - pt[1]) <= param["drag radius"]:
                 param["selected"] = i; break
+        if param["selected"] is None and param["placing"] is True:
+            from_screen = param["from_screen"](np.array([x, y], float))
+            param["p"].append(from_screen)
+            param["q"].append(from_screen)
     elif event == cv2.EVENT_MOUSEMOVE and param["selected"] is not None:
-        param["points"][param["selected"]] = param["from_screen"](np.array([x, y], float))
+        param["q"][param["selected"]] = param["from_screen"](np.array([x, y], float))
+        param["changed"] = True
     elif event == cv2.EVENT_LBUTTONUP:
         param["selected"] = None
 
@@ -130,16 +136,22 @@ def render_warp(img, g, gt, out_dims, shift=4):
         + (s * t)[:, None] * C0 + ((1 - s) * t)[:, None] * D0
     map_x = np.full((h, w), -1, np.float32); map_y = np.full((h, w), -1, np.float32)
     map_x[ys, xs], map_y[ys, xs] = src[:, 0], src[:, 1]
-    return cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+    return cv2.remap(img, map_x, map_y, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
 
 def move_points(img,p,name,K=2.5,S=800,grid_res=10):
+    #store mutable lists for p and q
+    #q starts as copy of p
+    q = p.copy() 
+    plist = p.tolist()
+    qlist = q.tolist()
+
     h, w = img.shape[:2]
     scale = max(h,w) / PX
     win = "Image Deformation with MLS"
     cv2.namedWindow(win)
     grid = compute_grid(h, w, grid_res)
     MARGIN = 40
-    S = max(S, max(h, w) + 2 * MARGIN)                  # one canvas size for every mode
+    S = max(S, max(h, w) + 2 * MARGIN) 
     scr_c = np.array([(S - 1) / 2] * 2)
     r_px = S / 2 - 10
     offset = np.array([(S - w) / 2, (S - h) / 2])  
@@ -151,13 +163,20 @@ def move_points(img,p,name,K=2.5,S=800,grid_res=10):
     z_grid = to_disk(grid) 
     z_p = to_disk(p)
     geo_d2 = d2_geodesic(p, grid, img)
-    q = p.copy() #image space coords
+    
     warp_state = dict(metric=0, warp=0, ripple=False, lam=MIN_LAM * half_diag)
-    state = {"points": q, "selected": None, "drag radius": DRAG_RAD,
-             "to_screen": None, "from_screen": None}
+    state = {"q": qlist, "p": plist, "changed": True, "selected": None, "drag radius": scale*DRAG_RAD,
+             "to_screen": None, "from_screen": None, "placing": False}
     cv2.setMouseCallback(win, click_event_warp, param=state)
     cv2.createTrackbar("Lambda", win, 0, 100, lambda _: None)
     hyp = lambda: METRICS[warp_state["metric"]] == "hyperbolic"
+    num_ctrl_points = len(plist)
+
+    def rebuild_p():
+        z_p = to_disk(p)
+        geo_d2 = d2_geodesic(p, grid, img)
+        return z_p, geo_d2
+
     def rebuild():
         metric = METRICS[warp_state["metric"]]
         warp = WARPS[warp_state["warp"]]
@@ -185,7 +204,7 @@ def move_points(img,p,name,K=2.5,S=800,grid_res=10):
         return render_warp(img, grid, deform_euclidean(A, wn, q, warp, vbl)+offset, (S, S))
 
     def load_image(new_img, new_p):
-        nonlocal img, p, h, w, grid, img_c, half_diag, offset, z_grid, z_p, geo_d2, model, last_q
+        nonlocal img, p, q, h, w, grid, img_c, half_diag, offset, z_grid, z_p, geo_d2, model, state, plist, qlist, num_ctrl_points
         img = new_img
         h, w = img.shape[:2]
         grid = compute_grid(h, w, grid_res)
@@ -194,28 +213,44 @@ def move_points(img,p,name,K=2.5,S=800,grid_res=10):
         offset = np.array([(S - w) / 2, (S - h) / 2])
         p = np.asarray(new_p, float)
         q[:] = p 
+        plist = p.tolist()
+        qlist = q.tolist()
+        num_ctrl_points = len(plist)
         z_grid, z_p = to_disk(grid), to_disk(p)
         geo_d2 = d2_geodesic(p, grid, img)
-        model, last_q = rebuild(), None  
+        model = rebuild()
+        state["changed"] = True
 
     def bake():
         shown = state["to_screen"](q) # handle positions on the canvas
         x, y, bw, bh = cv2.boundingRect(warped.any(-1).astype(np.uint8))# crop to bounding box around the content
         load_image(warped[y:y + bh, x:x + bw].copy(), shown - [x, y])
 
-    model, dirty, last_q = rebuild(), False, None
+    model, dirty= rebuild(), False, 
     # MAIN RENDER LOOP
     while True:
+        #get trackbar values
         t = cv2.getTrackbarPos("Lambda", win) / 100
         lam = ((1 - t) * MIN_LAM + t * MAX_LAM) * half_diag
+
+        #update state based on trackbar values
         if lam != warp_state["lam"]:
             warp_state["lam"] = lam
             dirty |= METRICS[warp_state["metric"]] == "polar"
+
+        #update model (constants: A, weights, and norms)
         if dirty:
-            model, dirty, last_q = rebuild(), False, None
-        if last_q is None or not np.array_equal(q, last_q):
+            model, dirty = rebuild(), False
             warped = render(*model)
-            last_q = q.copy()
+
+        if state["changed"]:
+            #update q array
+            q = np.array(qlist)
+            #re-render warped image
+            warped = render(*model)
+            #set changed to false
+            state["changed"] = False
+            
         disp = warped.copy()
         for i, pt in enumerate(state["to_screen"](q)):
             color = (0, 0, 255) if i == state["selected"] else (0, 255, 0)
@@ -225,10 +260,20 @@ def move_points(img,p,name,K=2.5,S=800,grid_res=10):
             cv2.circle(disp, tuple(int(c) for c in scr_c), int(r_px), (90, 90, 90), 1) #render outer rim
 
         cv2.setWindowTitle(win, f"{WARPS[warp_state['warp']]} | {METRICS[warp_state['metric']]} | ripple "
-                                f"{'on' if warp_state['ripple'] else 'off'}   [m]ode [d]istance [r]ipple [s]ave [q]uit")
+                                f"{'on' if warp_state['ripple'] else 'off'} | can place? " f"{'yes' if state["placing"] else 'no'}  [m]ode [d]istance [r]ipple [s]ave [q]uit")
         cv2.imshow(win, disp)
 
         key = cv2.waitKey(1) & 0xFF
+        #check if new points have been added or removed
+        if(num_ctrl_points != len(plist)):
+            #if P changed, we need to recompute constants/weights (mark as dirty)
+            #AND update P, Q, z_p (poincare disk coords of p) and geo_d2 (cost map for gradient aware distance mode)
+            dirty = True
+            num_ctrl_points = len(plist)
+            p = np.array(plist)
+            q = np.array(qlist)
+            z_p, geo_d2 = rebuild_p()
+            print(f"control point added at {p[-1]}")
         if key == ord("m"): 
             warp_state["warp"] = (warp_state["warp"] + 1) % len(WARPS)
             dirty = True
@@ -242,6 +287,8 @@ def move_points(img,p,name,K=2.5,S=800,grid_res=10):
             cv2.imwrite(f"../data/{name}_{METRICS[warp_state['metric']]}_{WARPS[warp_state['warp']]}.png", warped)
         elif key == ord("b"):
             bake()
+        elif key == ord("p"):
+            state["placing"] = not state["placing"]
 
         elif key in (27, ord("q")): break
 
