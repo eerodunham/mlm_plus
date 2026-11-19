@@ -8,12 +8,11 @@ from scipy.ndimage import map_coordinates
 import cv2
 
 #precompute distances based on minimizing the energy function equal to sum(|grad|)
-def d2_geodesic(P, grid, img, step=2, blur_sigma=1.5, B=20, eps=1e-9):
-    cost = compute_cost(img, step, blur_sigma, B)
+def d2_geodesic(P, grid, cost, r, c, v, step=2, eps=1e-9):
+    
     gh, gw = cost.shape
     n_nodes = gh * gw
     n_points = len(P)
-    r, c, v = gradient_graph(cost, step)
     p_sub= P/step
     sr, sc, sv = [],[],[]
     for i, (x,y) in enumerate(p_sub):
@@ -30,7 +29,7 @@ def d2_geodesic(P, grid, img, step=2, blur_sigma=1.5, B=20, eps=1e-9):
     return Dg.reshape(grid.shape[0], grid.shape[1], n_points) ** 2 #reshape to (h, w, n), square and return
 
 #compute the gradient magnitude across the image using a sobel filter
-def compute_cost(img, step, blur_sigma, B):
+def compute_cost(img, step=2, blur_sigma=1.5, B=20):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float64) / 255
 
     #standard blur first
@@ -49,7 +48,7 @@ def compute_cost(img, step, blur_sigma, B):
     return cost #cost is 1+B*|Del|; shape (gh,gw)
 
 #build and return rows, columns and edge weights  
-def gradient_graph(cost_map, step):
+def gradient_graph(cost_map, step=2):
     gh, gw = cost_map.shape
     idx = np.arange(gw*gh).reshape(gh,gw)
     rows, cols, vals = [],[],[]

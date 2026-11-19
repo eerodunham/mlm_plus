@@ -57,15 +57,6 @@ def precompute_weights(P, grid, mode="euclidean", alpha=1.0, eps=1e-8, ripple=Fa
         w *= 1 + B * np.cos(K * np.sqrt(d2))
     wn = w / w.sum(axis=-1, keepdims=True)
     return w, wn
-    
-def get_weights(P, grid, dist_fn, alpha=1.0, eps=1e-8, freq=False, B=0.8, K=0.3, **kw):
-    d2 = dist_fn(grid, P, **(kw or {}))
-    w = 1.0 / (d2 + eps) ** alpha
-    if freq:
-        assert abs(B) < 1, "In frequency mode, B (Freq modifier) must satisfy |B| < 1 to keep weights positive"
-        w *= 1 + B * np.cos(K * np.sqrt(d2))
-    wn = w / w.sum(axis=-1, keepdims=True)
-    return w, wn
 
 #compute grid of anchor points (in coordnate-space)
 def compute_grid(h,w, resolution=20):
@@ -89,7 +80,7 @@ def compute_constants_from_centered(phat, vbar, w, mode="affine"):
         vbar_orth[:,:,0] = vbar[:,:,1]
         vbar_orth[:,:,1] = -vbar[:,:,0]
         #mu_s = sum_i w_ip_ip_i^T ->sum of inner products between weighted control points and unweighted control points 
-        mu_s = 1.0 / np.einsum('hwn,hwnx,hwnx->hw',w,phat,phat) #(h,w)
+        mu_s = 1.0 / np.einsum('hwn,hwnx,hwnx->hw',w,phat,phat, optimize=True) #(h,w)
         pmat = np.stack([phat, phat_orth], axis=-2) #(h,w,n,2,2)
         vmat = np.stack([vbar, vbar_orth], axis=-2)
         A = np.einsum('hw,hwn,hwnxy,hwzy->hwnxz',mu_s,w,pmat,vmat) #paper equation 7. Output A is (h,w,n,2,2)
@@ -129,16 +120,8 @@ def compute_constants_from_points(P: np.ndarray, grid: np.ndarray, w, wn, mode="
 
     """
     #compute weights for each control point. grid shape: (h,w,2); points shape: (npts, 2); 
-    psum = wn @ P #shape (h,w,2)
-    wsum = np.sum(wn, axis=-1, keepdims=True)
-    pstar = psum / wsum #shape (h,w,2)
     #phat is the pstar-centered set of control points
-    phat = P[None, None] - pstar[:, :, None, :]
-    psum = wn @ P #shape (h,w,2)
-    wsum = np.sum(wn, axis=-1, keepdims=True)
-    #pstar is the centroid of control points relative to each v
-    pstar = psum / wsum #shape (h,w,2)
-    #phat is the pstar-centered set of control points
+    pstar = wn @ P #shape (h,w,2)
     phat = P[None, None] - pstar[:, :, None, :]
     vbar = grid - pstar #vbar is the pstar-centered set of grid points
     vbar_len = np.sqrt(np.einsum('hwx,hwx->hw', vbar, vbar)) #(h,w)
@@ -208,6 +191,31 @@ def inv_bilinear(x,a,b,c,d):
     s = np.where(lin, s_of(t_lin), np.where(ok1, s1, s2))
     return np.clip(s, 0, 1), np.clip(t, 0, 1)
 
+#faster inverse bilinear warp function. Dense and hard to parse... but it's faster. (Claude helped with this one ;). )
+#in the future, i'll rewrite it myself before porting to opengl
+def inv_bilinear_fast(x,a,b,c,d):
+    e, f, g, hh = b - a, d - a, a - b + c - d, x - a
+    k2 = g[:,0]*f[:,1]-g[:,1]*f[:,0]
+    k1 = e[:,0]*f[:,1]-e[:,1]*f[:,0] + hh[:,0]*g[:,1]-hh[:,1]*g[:,0]
+    k0 = hh[:,0]*e[:,1]-hh[:,1]*e[:,0]
+    lin = np.abs(k2) < 1e-9
+    k2s = np.where(lin, 1.0, k2)
+    disc = np.sqrt(np.maximum(k1*k1 - 4*k0*k2, 0))
+    inv2k = 0.5/k2s
+    t1 = (-k1 - disc)*inv2k
+    t_lin = -k0 / np.where(np.abs(k1) < 1e-12, 1e-12, k1)
+    def s_of(t):
+        dx = e[:,0]+g[:,0]*t; dy = e[:,1]+g[:,1]*t
+        use_y = np.abs(dy) > np.abs(dx)
+        den = np.where(use_y, dy, dx)
+        num = np.where(use_y, hh[:,1]-f[:,1]*t, hh[:,0]-f[:,0]*t)
+        return num/np.where(np.abs(den)<1e-12,1e-12,den)
+    s1 = s_of(t1)
+    ok1 = (s1 >= -1e-3) & (s1 <= 1+1e-3) & (t1 >= -1e-3) & (t1 <= 1+1e-3)
+    t = np.where(lin, t_lin, np.where(ok1, t1, (-k1 + disc)*inv2k))
+    s = np.where(ok1 & ~lin, s1, s_of(t))
+    return np.clip(s,0,1), np.clip(t,0,1)
+
 # ---------------------------------------------------------------------
 # Transformations
 # ---------------------------------------------------------------------
@@ -227,41 +235,4 @@ def deform_euclidean(A, wn, q, mode, vbl):
     qstar = np.einsum('hwn,nx->hwx', wn, q)
     qhat = q[None, None] - qstar[:, :, None, :]
     return tangent_sum(A, qhat, mode, vbl) + qstar
-
-def get_affine(A: np.ndarray, wn: np.ndarray, q: np.ndarray):
-    """
-    computes f_a(v) = l_v for all v with AFFINE constraints
-    A: (h, w, n) -> constant affine transformation scalars from P
-    wn: (h,w,n) -> weights from P
-    q: (n, 2) -> warped control point positions
-    
-    returns fa(v): (h,w,2) -> transformed grid vertices
-    """
-    qstar = np.einsum('hwn,nx->hwx', wn, q)
-    qhat = q[None, None] - qstar[:, :, None, :]
-    # shape (h,w,n) * (h,w,n,2) -> (h,w,n,2)
-    qa = A[..., None] * qhat
-    #shape (h, w, 2)
-    transformed_v = np.sum(qa, axis=2) + qstar
-    return transformed_v
-
-def get_similarity(A: np.ndarray, wn: np.ndarray, q: np.ndarray):
-    """
-    computes f_a(v) = l_v for all v with SIMILARITY constraints
-    A: (h, w, n, 2, 2) -> constant similarity transformation matrices from P
-    wn: (h,w,n) -> weights from P
-    q: (n, 2) -> warped control point positions
-
-    returns fa(v): (h,w,2) -> transformed grid vertices
-    """
-    qstar = np.einsum('hwn,nx->hwx', wn, q)
-    qhat = q[None, None] - qstar[:, :, None, :]
-    return np.einsum('hwnx,hwnxy->hwy',qhat,A) + qstar
-
-def get_rigid(A: np.ndarray, wn: np.ndarray, q: np.ndarray, vbar_len: np.ndarray):
-    qstar = np.einsum('hwn,nx->hwx', wn, q)
-    qhat = q[None, None] - qstar[:, :, None, :]
-    f_r_v = np.einsum('hwnx,hwnxy->hwy',qhat,A)
-    norm_fr = 1.0 / np.maximum(np.sqrt(np.einsum('hwx,hwx->hw', f_r_v, f_r_v)), 1e-12)
-    return np.einsum('hw,hw,hwx->hwx', vbar_len, norm_fr, f_r_v) + qstar
 
