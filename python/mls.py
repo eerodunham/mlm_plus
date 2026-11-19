@@ -1,22 +1,18 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from numpy import linalg as la
-import argparse as ap
 import cv2
 from pathlib import Path
-import sys
-import math
 from typing import Any #to silence linter errors
 from grad_aware import d2_geodesic, gradient_graph, compute_cost
-import copy
 
 from utils import deform_euclidean, compute_constants_from_points, compute_grid, precompute_weights, inv_bilinear_fast
 from hyperbolic import deform_hyperbolic, screen_to_disk, disk_to_screen, image_to_disk, disk_to_image, compute_constants_from_hyperbolic_points
 WARPS   = ["affine", "similarity", "rigid"]
 METRICS = ["euclidean", "polar", "gradient", "hyperbolic"]
-
+INTERP = {"nn": cv2.INTER_NEAREST, "bl": cv2.INTER_LINEAR}
+MIN_POINTS = {"affine": 3, "similarity": 2, "rigid": 1}
 RAD = 2
-DRAG_RAD = RAD*2
 PX = 250
 
 RIPPLE_K_DISK = 0.3
@@ -27,90 +23,221 @@ MAX_HYP_R = 2
 MIN_LAM = 0.05
 MAX_LAM = 5
 
-def slider_event(x):
-    pass
+class WarpEngine:
+    def __init__(self, img, K=2.5, S=800, Smin=250, min_grid_px=10, ripple_k_disk=0.3, margin=40, interp_mode="bl", max_radius = 0.995):
+        self.K = K
+        self.ui_scale = S / Smin
+        self.drag_radius = self.ui_scale * RAD * 2
+        self.canvas_size=S
+        self.min_grid_px = min_grid_px
+        self.warp_i = 0
+        self.met_i = 0
+        self.ripple = False
+        self.placing = True
+        self.lam_t = 0.0
+        self.selected_i = None
+        self.margin = margin
+        self.ripple_k_disk = ripple_k_disk
+        self.interp = INTERP[interp_mode]
+        self.max_radius = max_radius
+        self.unselected_color = (0, 255, 0)
+        self.selected_color = (0, 0, 255)
+        self.load_img(img)
+    def load_img(self, img, p=None):
+        '''Re-initializes anything that depends on the image.'''
+        self.img = img
+        self.h, self.w = img.shape[:2] 
+        self.grid_res = max(self.min_grid_px, max(self.h, self.w) // 150)
+        self.grid = compute_grid(self.h, self.w, self.grid_res)
+        self.img_center = np.array([(self.w - 1) / 2, (self.h - 1) / 2])
+        self.half_diag = np.hypot(*self.img_center)
+        self.disk_grid = self._to_disk(self.grid)
+        self.preview = self._make_view(min(1.0, (self.canvas_size - 2 * self.margin) / max(self.h, self.w)), self.canvas_size)
+        self.gradient_cost = compute_cost(img)
+        self.gradient_graph = gradient_graph(self.gradient_cost)
+        self.selected_i = None
+        self._set_points_array(np.empty((0,2)) if p is None else p)
+    def _set_points_array(self, p):
+        """replace control point array and deformed array to match"""
+        self.p = np.array(p).astype(np.float32).reshape(-1,2)
+        self.q = self.p.copy()
+        self._points_changed()
+    def _points_changed(self):
+        """Called whenever a control point is added or removed. Updates anything derived from 
+        the control point set P (Weights, constants A_i, and disk coordinates)"""
+        self.disk_p = self._to_disk(self.p)
+        self.geo_d2 = None #gradient distance metrics need updating, so mark as stale
+        self.dirty = True #dirty means we need re-computation of weights and constants
+        self.changed = True #changed means we need to re-render.
 
-def click_event_place(event, x, y, flags, param):
-    if event==cv2.EVENT_LBUTTONDOWN:
-        for i, pt in enumerate(param["points"]):
-            dist = math.hypot(x-pt[0], y-pt[1])
-            if dist <= param["drag radius"]:
-                param["selected"] = i
-                break
+    # state property (state? THIS? STATE? Hit the road duuuude, this ain't no state property, this is *PRIVATE* propertuh)
+    @property
+    def warp(self): return WARPS[self.warp_i]
+    @property
+    def metric(self): return METRICS[self.met_i]
+    @property
+    def hyp(self): return self.metric == "hyperbolic"
+    @property
+    def grad(self): return self.metric == "gradient"
+    @property
+    def lamb(self): return  ((1 - self.lam_t) * MIN_LAM + self.lam_t * MAX_LAM) * self.half_diag
 
-        if param["selected"] is None:
-            param["points"].append([x,y])
-
-    elif event == cv2.EVENT_MOUSEMOVE:
-         if param["selected"] is not None:
-            param["points"][param["selected"]] = (x, y)
-
-    elif event == cv2.EVENT_LBUTTONUP:
-        param["selected"] = None
-
-def click_event_warp(event, x, y, flags, param):
-    if event == cv2.EVENT_LBUTTONDOWN:
-        for i, pt in enumerate(param["to_screen"](param["q"])):
-            if math.hypot(x - pt[0], y - pt[1]) <= param["drag radius"]:
-                param["selected"] = i; break
-        if param["selected"] is None and param["placing"] is True:
-            from_screen = param["from_screen"](np.array([x, y], float))
-            param["p"].append(from_screen)
-            param["q"].append(from_screen)
-    elif event == cv2.EVENT_MOUSEMOVE and param["selected"] is not None:
-        param["q"][param["selected"]] = param["from_screen"](np.array([x, y], float))
-        param["changed"] = True
-    elif event == cv2.EVENT_LBUTTONUP:
-        param["selected"] = None
-        param["changed"] = True
-
-# def click_event_warp(event, x, y, flags, param):
-#     if event==cv2.EVENT_LBUTTONDOWN:
-#         for i, pt in enumerate(param["points"]):
-#             dist = math.hypot(x-pt[0], y-pt[1])
-#             if dist <= param["drag radius"]:
-#                 param["selected"] = i
-#                 break
-
-#     elif event==cv2.EVENT_MOUSEMOVE:  
-#         if param["selected"] is not None:
-#             param["points"][param["selected"]] = (x,y)
-
-#     elif event == cv2.EVENT_LBUTTONUP:
-#             param["selected"] = None
-
-def place_points(img, points):
-    print("-----++++++INSTRUCTIONS++++++-----\nClick to place a new control point. Click and drag to move an existing one. Q or ESC to exit window. R to reset points.")
-    h,w,_ = img.shape
-    scale = max(h,w) / PX
-    radius = np.floor(RAD*scale).astype(int)
-    drag_radius = np.floor(DRAG_RAD*scale)
-    state = {"points": points, "image": img, "selected": None, "drag radius": drag_radius}
-    cv2.namedWindow("Place Control Points")
-    cv2.setMouseCallback("Place Control Points", click_event_place, param=state)
+    def can_warp(self):
+        return len(self.p) >= MIN_POINTS[self.warp]
+    def sidebar_status(self):
+        return dict(warp=self.warp, metric=self.metric, ripple=self.ripple, placing=self.placing, n_points=len(self.p), need_points=max(0, MIN_POINTS[self.warp] - len(self.p)))
+    def _to_disk(self, x): return image_to_disk(x, self.img_center, self.K, self.half_diag)
+    def _from_disk(self, z): return disk_to_image(z, self.img_center, self.K, self.half_diag)
+    def _make_view(self, scale, canvas_size):
+        """Resize image to view window's size and recompute dependent values."""
+        return {
+            "img": self.img if scale == 1 else cv2.resize(self.img, None, fx=scale, fy=scale, interpolation=self.interp),
+            "grid": self.grid * scale,
+            "offset": (canvas_size - scale * np.array([self.w, self.h])) / 2,
+            "disk center": np.array([(canvas_size - 1) / 2] * 2),
+            "disk radius":   canvas_size / 2 - 10,
+            "scale":  scale, 
+            "canvas size": canvas_size
+        }
+    def _full_view(self):
+        """Resize back to full resolution for saving and baking"""
+        return self._make_view(1.0, max(self.h, self.w) + 2 * self.margin)
     
-    while True:
-        disp_img = img.copy()
+    def to_screen(self, x, preview=None):
+        """Takes image coordinates x and converts them to screen coordinates s_x, based on the size of the 
+        view window. Performs hyperbolic projection if necessary"""
+        preview = preview or self.preview
+        x = np.asarray(x, float)
+        if self.hyp:
+            return disk_to_screen(self._to_disk(x), preview["disk center"], preview["disk radius"])
+        return x * preview["scale"] + preview["offset"]
 
-        for i, pt in enumerate(points):
-            color = (0, 0, 255) if i == state["selected"] else (0, 255, 0)
-            cv2.circle(disp_img, pt, radius, color, -1)
+    def from_screen(self, x, preview=None):
+        preview = preview or self.preview
+        x = np.asarray(x, float)
+        if self.hyp:
+            return self._from_disk(screen_to_disk(x, preview["disk center"], preview["disk radius"], self.max_radius))
+        return (x - preview["offset"]) / preview["scale"]
+    
+    def _rebuild(self):
+         """Recomputes weights and constants (A, wn, vbl) from p when necessary"""
+         self.dirty = False #only call if dirty is true
+         if not self.can_warp():
+             self.model = None
+             return
+         if self.hyp:
+             wt, wn = precompute_weights(self.disk_p, self.disk_grid, "disk", eps=1e-12,
+                                        ripple=self.ripple, K=self.ripple_k_disk)
+             A, vbl = compute_constants_from_hyperbolic_points(self.disk_p, self.disk_grid, wt, wn, mode=self.warp)
+         else:
+            if self.grad and self.geo_d2 is None:
+                self.geo_d2 = d2_geodesic(self.p, self.grid, self.gradient_cost, *self.gradient_graph)
+            dist_kw = {"polar":    dict(center=self.img_center, lam=self.lamb),
+                       "gradient": dict(dist=self.geo_d2)}.get(self.metric, {})
+            wt, wn = precompute_weights(self.p, self.grid, self.metric,
+                                        ripple=self.ripple, dist_kw=dist_kw)
+            A, vbl = compute_constants_from_points(self.p, self.grid, wt, wn, mode=self.warp)
+         self.model = (A, wn, vbl)
 
-        cv2.imshow("Place Control Points", disp_img)
+    def _sync(self):
+        if self.dirty:
+            self._rebuild()
 
-        key = cv2.waitKey(1) & 0xFF
-        #ESCAPE or Q to quit
-        if key == 27 or key == ord("q"):
-            break
-        # R to reset
-        elif key == ord("r"):
-            points.clear()
-            state["selected"] = None
+    def _render(self, v):
+        """Deform the grid with the current q (deformed control points) and rasterize into view v. runs per drag."""
+        if self.model is None:
+            dest = self.to_screen(self.grid, v)
+        else:
+            A, wn, vbl = self.model
+            if self.hyp:
+                z = deform_hyperbolic(A, wn, self._to_disk(self.q), self.warp, vbl)
+                dest = disk_to_screen(z, v["disk center"], v["disk radius"])
+            else:
+                dest = deform_euclidean(A, wn, self.q, self.warp, vbl) * v["scale"] + v["offset"]
+        return render_warp(v["img"], v["grid"], dest, (v["canvas size"], v["canvas size"]), self.interp)
 
-    cv2.destroyAllWindows()
+    def tick(self):
+        """Call once per UI frame. Returns a new BGR canvss_size×canvas_size frame, or None if nothing changed."""
+        if not (self.dirty or self.changed):
+            return None
+        self._sync()
+        self.changed = False
+        frame = self._render(self.preview)
+        for i, pt in enumerate(self.to_screen(self.q)):
+            color = self.selected_color if i == self.selected_i else self.unselected_color
+            cv2.circle(frame, tuple(int(c) for c in pt), int(self.ui_scale * RAD), color, -1)
+        if self.hyp:
+            cv2.circle(frame, tuple(int(c) for c in self.preview["disk center"]), int(self.preview["disk radius"]),
+                       (90, 90, 90), 1)
+        return frame
+
+    def set_warp(self, i): self.warp_i = i;   self.dirty = True
+    def set_metric(self, i): self.met_i = i; self.dirty = True
+    def set_ripple(self, on): self.ripple = bool(on); self.dirty = True
+
+    def set_lambda(self, t01):
+        self.lam_t = float(t01)
+        if self.metric == "polar":
+            self.dirty = True
+
+    def set_placing(self, on):
+        self.placing = bool(on)
+        self.changed = True #redraw so ui status changes
+
+    def reset_points(self):
+        """Removes all control points."""
+        self.selected_i = None
+        self._set_points_array(np.empty((0, 2)))
+
+    def mouse_down(self, x, y):
+        """Select the nearest control point within the drag_radius. add a point if placing is on and nothing is selected."""
+        if len(self.q):
+            d = np.hypot(*(self.to_screen(self.q) - [x, y]).T)
+            i = int(np.argmin(d))
+            if d[i] <= self.drag_radius:
+                self.selected_i = i
+                self.changed = True #redraw handle color
+                return
+        if self.placing:
+            pt = self.from_screen([x, y])
+            self.p = np.vstack([self.p, pt])
+            self.q = np.vstack([self.q, pt])
+            self._points_changed()
+
+    def mouse_move(self, x, y):
+        """Drag the selected handle. Only q changes, so not marked dirty, just redraw."""
+        if self.selected_i is not None:
+            self.q[self.selected_i] = self.from_screen([x, y])
+            self.changed = True
+
+    def mouse_up(self):
+        if self.selected_i is not None:
+            self.selected_i = None
+            self.changed = True #redraw handle color
+
+    def render_full(self):
+        """Full-resolution render for saving, with no control points"""
+        return self._render(self._full_view())
+
+    def save(self, path):
+        self._sync()
+        return cv2.imwrite(str(path), self.render_full())
+
+    def default_filename(self, stem):
+        return f"{stem}_{self.metric}_{self.warp}.png"
+
+    def bake(self):
+        """Make the current deformation the new source image, keeping handles where they are. Grid is flattened."""
+        self._sync()
+        v = self._full_view()
+        out = self._render(v)
+        shown = self.to_screen(self.q, v) # handle positions on the full-res canvas
+        x, y, bw, bh = cv2.boundingRect(out.any(-1).astype(np.uint8)) # crop to content
+        self.selected = None
+        self.load_img(out[y:y + bh, x:x + bw].copy(), shown - [x, y])
 
 
-def render_warp(img, g, gt, out_dims, shift=4):
+def render_warp(img, g, gt, out_dims, interp, shift=4):
     h, w = out_dims
     gh, gw = g.shape[:2]
     raster_ids = np.full((h,w),-1,np.int32)
@@ -143,241 +270,5 @@ def render_warp(img, g, gt, out_dims, shift=4):
     map_y = np.full(h*w,-1,np.float32)
     map_x[linear_idx] = gx[c] + s*(gx[c+1]-gx[c]) #find corresponding x and y transformed vertices from mapped raster ids and s,t coordinates
     map_y[linear_idx] = gy[r] + t*(gy[r+1]-gy[r])
-    return cv2.remap(img, map_x.reshape(h,w), map_y.reshape(h,w), cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
+    return cv2.remap(img, map_x.reshape(h,w), map_y.reshape(h,w), interp, borderMode=cv2.BORDER_CONSTANT)
 
-def move_points(img,p,name,K=2.5,S=800,min_grid_res=10):
-    #store mutable lists for p and q
-    #q starts as copy of p
-    q = p.copy() 
-    plist = p.tolist()
-    qlist = q.tolist()
-
-    h, w = img.shape[:2]
-    scale = max(h,w) / PX
-    ui = S/PX
-    win = "Image Deformation with MLS"
-    cv2.namedWindow(win)
-    grid_res = max(min_grid_res, max(h, w) // 150)
-    grid = compute_grid(h, w, grid_res)
-    MARGIN = 40
-    img_c = np.array([(w - 1) / 2, (h - 1) / 2])
-    half_diag = np.hypot(*img_c)
-    to_disk = lambda x: image_to_disk(x, img_c, K, half_diag) #convert image coords x to disk coords z
-    from_disk = lambda z: disk_to_image(z, img_c, K, half_diag) #convert poincare disk coords z to image coords x
-    z_grid = to_disk(grid) 
-    z_p = to_disk(p)
-
-    def resample_to_view(scale, S):
-        new_img=img if scale == 1 else cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        new_grid=grid * scale
-        offset=(S - scale * np.array([w, h])) / 2
-        c=np.array([(S - 1) / 2] * 2)
-        r_px=S / 2 - 10
-        return {'img': new_img, 'grid': new_grid, 'offset': offset, 'c': c, 'r_px': r_px, 'scale': scale, 'S': S }
-
-    warp_view = lambda: resample_to_view(min(1.0, (S - 2 * MARGIN) / max(h, w)), S)
-    full_view = lambda: resample_to_view(1.0, max(h, w) + 2 * MARGIN)
-    live = warp_view()
-    #cache cost map and graph (depends only on img)
-    grad_cost = compute_cost(img)   
-    graph = gradient_graph(grad_cost)
-    graph_stale = True
-    geo_d2 = None
-    warp_state = dict(metric=0, warp=0, ripple=False, lam=MIN_LAM * half_diag)
-    state = {"q": qlist, "p": plist, "changed": True, "selected": None, "drag radius": ui*DRAG_RAD,
-             "to_screen": None, "from_screen": None, "placing": False}
-    cv2.setMouseCallback(win, click_event_warp, param=state)
-    cv2.createTrackbar("Lambda", win, 0, 100, lambda _: None)
-    hyp = lambda: METRICS[warp_state["metric"]] == "hyperbolic"
-    grad = lambda: METRICS[warp_state["metric"]] == "gradient"
-    num_ctrl_points = len(plist)
-
-    def to_screen(x, v):
-        x = np.asarray(x, float) #mouse callback passes the qlist (a python list)
-        if hyp(): return disk_to_screen(to_disk(x), v["c"], v["r_px"])
-        return x * v["scale"] + v["offset"]
-
-    def from_screen(y, v):
-        y = np.asarray(y, float)
-        if hyp(): return from_disk(screen_to_disk(y, v["c"], v["r_px"]))
-        return (y - v["offset"]) / v["scale"]
-
-    def rebuild_p():
-        z_p = to_disk(p)
-        return z_p
-
-    def rebuild():
-        metric = METRICS[warp_state["metric"]]
-        warp = WARPS[warp_state["warp"]]
-        state["to_screen"] = lambda x: to_screen(x, live)
-        state["from_screen"] = lambda y: from_screen(y, live)
-        if hyp():
-            wt, wn = precompute_weights(z_p, z_grid, "disk", eps=1e-12, ripple=bool(warp_state["ripple"]), K=RIPPLE_K_DISK)
-            A, vbl = compute_constants_from_hyperbolic_points(z_p, z_grid, wt, wn, mode=warp)
-        else:
-            dist_kw = {"polar": dict(center=img_c, lam=warp_state["lam"]), "gradient": dict(dist=geo_d2)}.get(metric, {})
-            wt, wn = precompute_weights(p, grid, metric, ripple=bool(warp_state["ripple"]), dist_kw=dist_kw)
-            A, vbl = compute_constants_from_points(p, grid, wt, wn, mode=warp)
-        return A, wn, vbl
-    
-    def render(v, A, wn, vbl):
-        warp = WARPS[warp_state["warp"]]
-
-        if hyp():
-            dest = disk_to_screen(deform_hyperbolic(A, wn, to_disk(q), warp, vbl), v["c"], v["r_px"])
-        else:
-            dest = deform_euclidean(A, wn, q, warp, vbl) *v["scale"] + v["offset"]
-        
-        return render_warp(v["img"], v["grid"], dest, (v["S"], v["S"]))
-
-    def load_image(new_img, new_p):
-        nonlocal img, p, q, h, w, grid, img_c, half_diag, z_grid, z_p, geo_d2, model, plist, qlist, num_ctrl_points, live, graph, grad_cost, graph_stale
-        img = new_img
-        h, w = img.shape[:2]
-        grid_res = max(min_grid_res, max(h, w) // 150)
-        grid = compute_grid(h, w, grid_res)
-        live=warp_view()
-        p = np.asarray(new_p, float)
-        q[:] = p 
-        plist = p.tolist()
-        qlist = q.tolist()
-        grad_cost = compute_cost(img)
-        graph = gradient_graph(img)
-        if grad():
-            geo_d2 = d2_geodesic(p,grid,grad_cost,*graph)
-            graph_stale = False
-        else:
-            graph_stale = True
-
-        state["p"], state["q"] = plist, qlist
-        num_ctrl_points = len(plist)
-        #recompute image center and half-diagonal based on new dimensions so hyperbolic projection isn't based on old values
-        img_c = np.array([(w - 1) / 2, (h - 1) / 2])
-        half_diag = np.hypot(*img_c)
-        z_grid, z_p = to_disk(grid), to_disk(p)
-        model = rebuild()
-        state["changed"] = True
-
-    def bake():
-        v = full_view()
-        out = render(v, *model)
-        shown = to_screen(q, v) # handle positions on the canvas
-        x, y, bw, bh = cv2.boundingRect(out.any(-1).astype(np.uint8))# crop to bounding box around the content
-        load_image(out[y:y + bh, x:x + bw].copy(), shown - [x, y])
-
-    def draw_to_screen():
-        disp = render(live, *model)
-        for i, pt in enumerate(state["to_screen"](q)):
-            color = (0, 0, 255) if i == state["selected"] else (0, 255, 0)
-            cv2.circle(disp, tuple(int(c) for c in pt), int(ui*RAD), color, -1)
-
-        if hyp():
-            cv2.circle(disp, tuple(int(c) for c in live["c"]), int(live["r_px"]), (90, 90, 90), 1) #render outer rim
-
-        cv2.setWindowTitle(win, f"{WARPS[warp_state['warp']]} | {METRICS[warp_state['metric']]} | ripple "
-                            f"{'on' if warp_state['ripple'] else 'off'} | can place? " f"{'yes' if state["placing"] else 'no'}  [m]ode [d]istance [r]ipple [s]ave [q]uit")
-        cv2.imshow(win, disp)
-
-    model, dirty= rebuild(), False
-    draw_to_screen()
-    
-    # MAIN RENDER LOOP
-    while True:
-        #check if gradient mode has been switched on and graph is still stale
-        if grad() and graph_stale:
-            geo_d2 = d2_geodesic(p, grid, grad_cost, *graph)
-            graph_stale = False
-
-        #get trackbar values
-        t = cv2.getTrackbarPos("Lambda", win) / 100
-        lam = ((1 - t) * MIN_LAM + t * MAX_LAM) * half_diag
-
-        #update state based on trackbar values
-        if lam != warp_state["lam"]:
-            warp_state["lam"] = lam
-            dirty |= METRICS[warp_state["metric"]] == "polar"
-
-        #changes have been made, trigger re-render
-        if dirty or state["changed"]:
-            if dirty:
-                model, dirty = rebuild(), False
-            if state["changed"]:
-                #update q array
-                q = np.array(qlist)
-                #set changed to false
-                state["changed"] = False
-            #only draw when changes have been made
-            draw_to_screen()
-
-        key = cv2.waitKey(1) & 0xFF
-        #check if new points have been added or removed
-        if(num_ctrl_points != len(plist)):
-            #if P changed, we need to recompute constants/weights (mark as dirty)
-            #AND update P, Q, z_p (poincare disk coords of p) and geo_d2 (cost map for gradient aware distance mode)
-            dirty = True
-            num_ctrl_points = len(plist)
-            p = np.array(plist)
-            q = np.array(qlist)
-            z_p = rebuild_p()
-            if grad():
-                geo_d2 = d2_geodesic(p, grid, grad_cost, *graph)
-                graph_stale = False
-            else:
-                graph_stale = True
-            print(f"control point added at {p[-1]}")
-        if key == ord("m"): 
-            warp_state["warp"] = (warp_state["warp"] + 1) % len(WARPS)
-            dirty = True
-        elif key == ord("d"): 
-            warp_state["metric"] = (warp_state["metric"] + 1) % len(METRICS)
-            dirty = True
-        elif key == ord("r"): 
-            warp_state["ripple"] = not warp_state["ripple"]
-            dirty = True
-        elif key == ord("s"): 
-            cv2.imwrite(f"../data/{name}_{METRICS[warp_state['metric']]}_{WARPS[warp_state['warp']]}.png", render(full_view(),*model))
-        elif key == ord("b"):
-            bake()
-        elif key == ord("p"):
-            state["placing"] = not state["placing"]
-            state["changed"] = True
-
-        elif key in (27, ord("q")): break
-
-    cv2.destroyAllWindows()
-
-
-#MAIN FUNCTION
-def main():
-    parser = ap.ArgumentParser(description="MLM Python Demo")
-    parser.add_argument("path", type=str, help="Path to image file.")
-    parser.add_argument("-o", "--output_name", default=None, type=str, help="name of output file (without filetype)")
-    parser.add_argument("-k", "--kap_hyp", default=2.5, type=np.float32, help="Number of hyperbolic unit distances the image's screen half-diagonal should cover")
-    parser.add_argument("-r", "--grid_res", default=10, type=int, help="Number of pixels per grid square axis")
-    parser.add_argument("-c", "--canvas", default=800, type=int, help="Number of pixels per canvas axis")
-
-    args = parser.parse_args()
-
-    img_path = Path(args.path)
-    
-    if img_path.exists():
-        print(f'Opening image at path {args.path}')
-    else:
-        raise FileNotFoundError("Image file not found!")
-
-    img = cv2.imread(args.path)
-    if img is None:
-        raise ValueError("Image could not be read.")
-    h, w, _ = img.shape
-    name = args.output_name if args.output_name is not None else img_path.stem
-    points = []
-    place_points(img, points)
-    #compute constants from control points
-    if(len(points) == 0):
-        print("adding center point")
-        points.append((w//2, h//2))
-    P = np.array(points).astype(np.float32)
-    move_points(img, P, name,K=args.kap_hyp,S=args.canvas,min_grid_res=args.grid_res)
-
-if __name__ == "__main__":
-    main()

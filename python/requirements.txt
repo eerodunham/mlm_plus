@@ -1,4 +1,5 @@
 numpy
 matplotlib
-opencv-python-5.0.0.93
+opencv-python=5.0.0.93
 scipy
+dearpygui
